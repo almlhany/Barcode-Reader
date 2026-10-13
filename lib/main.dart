@@ -1,152 +1,462 @@
-import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-void main()=> runApp(App());
-class App extends StatelessWidget{ @override Widget build(BuildContext c)=> MaterialApp(debugShowCheckedModeBanner:false, theme:ThemeData.dark(), home:AlarmApp());}
+import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'theme.dart';
 
-// ===== انواع النغمات =====
-class Tone{ String name; IconData icon; Tone(this.name,this.icon);}
-List<Tone> tones=[
-  Tone("افتراضي", Icons.music_note),
-  Tone("اذان الفجر", Icons.mosque),
-  Tone("رقمي حاد", Icons.surround_sound),
-  Tone("كلاسيك", Icons.album),
-  Tone("انذار قوي", Icons.warning_amber_rounded),
-  Tone("عصافير", Icons.eco),
-];
-
-class MyAlarm{
-  int id; int hour; int minute; String label; bool enabled; Tone tone; List<bool> days; bool vibrate;
-  MyAlarm({required this.id, required this.hour, required this.minute, this.label="منبه", this.enabled=true, required this.tone, List<bool>? days, this.vibrate=true}):days=days?? List.filled(7,true);
-  String get timeStr{ String p(int v)=>v.toString().padLeft(2,'0'); String am=hour>=12?"م":"ص"; int h=hour>12?hour-12: (hour==0?12:hour); return "${p(h)}:${p(minute)} $am"; }
-  String get time24{ String p(int v)=>v.toString().padLeft(2,'0'); return "${p(hour)}:${p(minute)}"; }
-  String get daysStr{
-    if(days.every((d)=>d)) return "كل يوم";
-    List<String> n=["ث","ن","ث","ر","خ","ج","س"]; List<String> s=[];
-    for(int i=0;i<7;i++) if(days[i]) s.add(n[i]);
-    return s.isEmpty? "مرة واحدة" : s.join("، ");
-  }
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await ScanStore.init();
+  runApp(const BarcodeReaderApp());
 }
 
-class AlarmApp extends StatefulWidget{ @override State<AlarmApp> createState()=>_A();}
-class _A extends State<AlarmApp>{
-  List<MyAlarm> alarms=[
-    MyAlarm(id:1, hour:5, minute:0, label:"صلاة الفجر", tone:tones[1], days:[false,true,true,true,true,true,false], vibrate:true),
-    MyAlarm(id:2, hour:7, minute:0, label:"الدوام", tone:tones[0]),
-  ];
-  late Timer clockTimer;
-  DateTime now=DateTime.now();
-  bool isRinging=false;
+class BarcodeReaderApp extends StatelessWidget {
+  const BarcodeReaderApp({Key? key}) : super(key: key);
 
-  @override void initState(){
-    super.initState();
-    clockTimer=Timer.periodic(Duration(seconds:1),(_){
-      setState(()=> now=DateTime.now());
-      _check();
-    });
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+        debugShowCheckedModeBanner: false,
+        title: 'Barcode Reader',
+        theme: ScannerTheme.dark,
+        home: const ScannerHome(),
+      );
+}
+
+// ============================================================
+// نموذج السجل
+// ============================================================
+class ScanRecord {
+  ScanRecord({
+    required this.value,
+    required this.format,
+    required this.time,
+  });
+
+  final String value;
+  final String format;
+  final DateTime time;
+
+  Map<String, dynamic> toJson() => {
+        'value': value,
+        'format': format,
+        'time': time.millisecondsSinceEpoch,
+      };
+
+  factory ScanRecord.fromJson(Map<String, dynamic> json) => ScanRecord(
+        value: json['value'] as String? ?? '',
+        format: json['format'] as String? ?? 'unknown',
+        time: DateTime.fromMillisecondsSinceEpoch(json['time'] as int? ?? 0),
+      );
+}
+
+// ============================================================
+// مخزن السجل (SharedPreferences)
+// ============================================================
+class ScanStore {
+  static late SharedPreferences _prefs;
+  static const _key = 'scan_history';
+
+  static Future<void> init() async {
+    _prefs = await SharedPreferences.getInstance();
   }
-  @override void dispose(){ clockTimer.cancel(); super.dispose();}
-  void _check(){
-    if(isRinging) return;
-    for(var a in alarms){
-      if(!a.enabled) continue;
-      if(now.hour==a.hour && now.minute==a.minute && now.second==0){
-        int w=now.weekday-1; // 0=الاثنين
-        if(!a.days[w] &&!a.days.every((d)=>d==false)) continue; // لو محدد ايام
-        _ring(a); break;
-      }
+
+  static List<ScanRecord> load() {
+    try {
+      final raw = _prefs.getString(_key);
+      if (raw == null) return <ScanRecord>[];
+      return (jsonDecode(raw) as List)
+          .map((e) => ScanRecord.fromJson(e as Map<String, dynamic>))
+          .toList();
+    } catch (_) {
+      return <ScanRecord>[];
     }
   }
-  void _ring(MyAlarm a){
-    setState(()=> isRinging=true);
-    showDialog(context:context, barrierDismissible:false, builder:(_)=> _RingScreen(alarm:a, onStop:(){ Navigator.pop(context); setState(()=> isRinging=false);}, onSnooze:(){
-      Navigator.pop(context); setState(()=> isRinging=false);
-      var snooze=now.add(Duration(minutes:5));
-      setState(()=> alarms.add(MyAlarm(id:DateTime.now().millisecondsSinceEpoch, hour:snooze.hour, minute:snooze.minute, label:"غفوة - ${a.label}", tone:a.tone, days:List.filled(7,true))));
-    }));
-  }
 
-  void _addEdit({MyAlarm? edit}){
-    TimeOfDay picked=edit!=null? TimeOfDay(hour:edit.hour, minute:edit.minute) : TimeOfDay.now();
-    String label=edit?.label??""; Tone tone=edit?.tone?? tones[0]; List<bool> days=edit!=null? List.from(edit.days) : List.filled(7,true); bool vibrate=edit?.vibrate?? true;
-    showModalBottomSheet(context:context, isScrollControlled:true, backgroundColor:Color(0xFF1A1A1A), builder:(_)=> StatefulBuilder(builder:(c,set){
-      return Padding(padding:EdgeInsets.only(bottom:MediaQuery.of(context).viewInsets.bottom, left:16,right:16,top:16), child:SingleChildScrollView(child:Column(mainAxisSize:MainAxisSize.min, children:[
-        Text(edit==null?"اضافة منبه":"تعديل المنبه", style:TextStyle(fontWeight:FontWeight.bold, fontSize:18)), SizedBox(height:16),
-        GestureDetector(onTap:() async { var t=await showTimePicker(context:context, initialTime:picked); if(t!=null) set(()=> picked=t);}, child:Container(padding:EdgeInsets.all(18), decoration:BoxDecoration(color:Colors.white10, borderRadius:BorderRadius.circular(16)), child:Row(mainAxisAlignment:MainAxisAlignment.center, children:[Icon(Icons.access_time, size:28), SizedBox(width:10), Text(picked.format(context), style:TextStyle(fontSize:30, fontWeight:FontWeight.bold))]))),
-        SizedBox(height:12),
-        TextField(controller:TextEditingController(text:label), onChanged:(v)=> label=v, decoration:InputDecoration(labelText:"اسم المنبه", filled:true, fillColor:Colors.white10, border:OutlineInputBorder(borderRadius:BorderRadius.circular(12),borderSide:BorderSide.none))),
-        SizedBox(height:12),
-        // اختيار النغمة
-        Align(alignment:Alignment.centerRight, child:Text("النغمة:", style:TextStyle(fontWeight:FontWeight.bold))), SizedBox(height:6),
-        SizedBox(height:50, child:ListView.builder(scrollDirection:Axis.horizontal, itemCount:tones.length, itemBuilder:(_,i)=> GestureDetector(onTap:(){ set(()=> tone=tones[i]); HapticFeedback.mediumImpact();}, child:Container(margin:EdgeInsets.only(left:8), padding:EdgeInsets.symmetric(horizontal:14), decoration:BoxDecoration(color: tone==tones[i]? Color(0xFFFE2C55) : Colors.white10, borderRadius:BorderRadius.circular(12)), child:Row(children:[Icon(tones[i].icon,size:18), SizedBox(width:6), Text(tones[i].name, style:TextStyle(fontSize:12))]))))),
-        SizedBox(height:12),
-        // تكرار ايام الاسبوع
-        Align(alignment:Alignment.centerRight, child:Text("تكرار:", style:TextStyle(fontWeight:FontWeight.bold))), SizedBox(height:6),
-        Row(mainAxisAlignment:MainAxisAlignment.spaceBetween, children: List.generate(7,(i){
-          List<String> d=["إ","ث","أ","خ","ج","س","أ"]; // اختصار
-          List<String> full=["الاثنين","الثلاثاء","الاربعاء","الخميس","الجمعة","السبت","الاحد"];
-          return GestureDetector(onTap:()=> set(()=> days[i]=!days[i]), child:Column(children:[Container(width:38,height:38, decoration:BoxDecoration(color:days[i]? Color(0xFFFE2C55) : Colors.white10, shape:BoxShape.circle), child:Center(child:Text(d[i], style:TextStyle(fontWeight:FontWeight.bold, fontSize:12)))), SizedBox(height:2), Text(full[i].substring(0,2), style:TextStyle(fontSize:9, color:Colors.white54))]));
-        })),
-        SizedBox(height:12),
-        // اهتزاز قوي
-        SwitchListTile(value:vibrate, activeColor:Color(0xFFFE2C55), title:Text("اهتزاز قوي"), subtitle:Text("Vibration", style:TextStyle(fontSize:10, color:Colors.white54)), secondary:Icon(Icons.vibration), onChanged:(v)=> set(()=> vibrate=v)),
-        SizedBox(height:12),
-        SizedBox(width:double.infinity, child:FilmedButton(label: edit==null?"حفظ المنبه":"تحديث", onPressed:(){
-          var na=MyAlarm(id:edit?.id?? DateTime.now().millisecondsSinceEpoch, hour:picked.hour, minute:picked.minute, label:label.isEmpty?"منبه":label, tone:tone, days:days, vibrate:vibrate);
-          setState(()=> { if(edit!=null) alarms.removeWhere((x)=> x.id==edit.id), alarms.add(na)});
-          Navigator.pop(context);
-        })),
-        SizedBox(height:20),
-      ])));
-    }));
-  }
-
-  @override Widget build(BuildContext c){
-    String p(int v)=>v.toString().padLeft(2,'0'); String am=now.hour>=12?"م":"ص"; int h=now.hour>12?now.hour-12: (now.hour==0?12:now.hour);
-    return Scaffold(backgroundColor:Color(0xFF0A0A0A), appBar:AppBar(backgroundColor:Colors.black, title:Text("ساعة منبه", style:TextStyle(fontWeight:FontWeight.w900)), centerTitle:true),
-      body:Column(children:[
-        Container(margin:EdgeInsets.all(14), padding:EdgeInsets.all(18), decoration:BoxDecoration(color:Color(0xFF1A1A1A), borderRadius:BorderRadius.circular(20)), child:Column(children:[
-          Text("${p(h)}:${p(now.minute)}:${p(now.second)} $am", style:TextStyle(fontSize:38, fontWeight:FontWeight.w900)),
-          Text("${now.year}/${p(now.month)}/${p(now.day)}", style:TextStyle(color:Colors.white54, fontSize:12)),
-        ])),
-        Expanded(child:ListView.builder(padding:EdgeInsets.all(10), itemCount:alarms.length, itemBuilder:(_,i){
-          var a=alarms[i];
-          return Container(margin:EdgeInsets.only(bottom:10), decoration:BoxDecoration(color:Color(0xFF1E1E1E), borderRadius:BorderRadius.circular(16)), child:ListTile(
-            onTap:()=> _addEdit(edit:a),
-            leading:Icon(a.tone.icon, color:a.enabled? Color(0xFFFE2C55) : Colors.white24),
-            title:Text(a.timeStr, style:TextStyle(fontSize:18, fontWeight:FontWeight.bold, color: a.enabled? Colors.white : Colors.white38)),
-            subtitle:Text("${a.label} • ${a.tone.name} • ${a.daysStr} ${a.vibrate?"• اهتزاز":""}", style:TextStyle(fontSize:10, color:Colors.white60)),
-            trailing:Row(mainAxisSize:MainAxisSize.min, children:[
-              Switch(value:a.enabled, activeColor:Color(0xFFFE2C55), onChanged:(v)=> setState(()=> a.enabled=v)),
-              IconButton(icon:Icon(Icons.delete_outline, size:20), onPressed:()=> setState(()=> alarms.removeAt(i))),
-            ]),
-          ));
-        })),
-      ]),
-      floatingActionButton:FloatingActionButton.extended(onPressed:()=> _addEdit(), backgroundColor:Color(0xFFFE2C55), icon:Icon(Icons.add_alarm), label:Text("منبه جديد")),
+  static Future<void> save(List<ScanRecord> records) async {
+    await _prefs.setString(
+      _key,
+      jsonEncode(records.map((e) => e.toJson()).toList()),
     );
   }
 }
 
-class _RingScreen extends StatefulWidget{ final MyAlarm alarm; final VoidCallback onStop,onSnooze; const _RingScreen({required this.alarm, required this.onStop, required this.onSnooze}); @override State<_RingScreen> createState()=>__R();}
-class __R extends State<_RingScreen> with SingleTickerProviderStateMixin{
-  late AnimationController anim; late Timer vibTimer;
-  @override void initState(){ super.initState(); anim=AnimationController(vsync:this, duration:Duration(milliseconds:500))..repeat(reverse:true);
-    vibTimer=Timer.periodic(Duration(milliseconds:700),(_){ if(widget.alarm.vibrate){ HapticFeedback.heavyImpact(); Future.delayed(Duration(milliseconds:150),()=> HapticFeedback.heavyImpact());}});
-  }
-  @override void dispose(){ anim.dispose(); vibTimer.cancel(); super.dispose();}
-  @override Widget build(BuildContext c)=> Scaffold(backgroundColor:Color(0xFFFE2C55), body:Center(child:Column(mainAxisAlignment:MainAxisAlignment.center, children:[
-    ScaleTransition(scale:Tween(begin:1.0,end:1.25).animate(anim), child:Icon(widget.alarm.tone.icon, size:90, color:Colors.white)),
-    SizedBox(height:16), Text("⏰ المنبه يرن!", style:TextStyle(fontSize:28, fontWeight:FontWeight.w900, color:Colors.white)),
-    SizedBox(height:8), Text(widget.alarm.label, style:TextStyle(fontSize:22, color:Colors.white, fontWeight:FontWeight.bold)),
-    SizedBox(height:4), Text("${widget.alarm.time24} • ${widget.alarm.tone.name}", style:TextStyle(color:Colors.white70)),
-    if(widget.alarm.vibrate) Padding(padding:EdgeInsets.only(top:6), child:Row(mainAxisAlignment:MainAxisAlignment.center, children:[Icon(Icons.vibration, color:Colors.white70, size:16), SizedBox(width:4), Text("اهتزاز قوي مفعل", style:TextStyle(color:Colors.white70, fontSize:11))])),
-    SizedBox(height:40),
-    Row(mainAxisAlignment:MainAxisAlignment.spaceEvenly, children:[
-      FilledButton(onPressed:widget.onSnooze, style: FilledButton.styleFrom(backgroundColor:Colors.white24, padding:EdgeInsets.symmetric(horizontal:24, vertical:14)), child:Text("غفوة 5 دقائق")),
-      FilmedButton(label:"ايقاف", onPressed:widget.onStop),
-    ])
-  ])));
+// ============================================================
+// الشاشة الرئيسية
+// ============================================================
+class ScannerHome extends StatefulWidget {
+  const ScannerHome({Key? key}) : super(key: key);
+
+  @override
+  State<ScannerHome> createState() => _ScannerHomeState();
 }
 
-class FilmedButton extends StatelessWidget{ final String label; final VoidCallback onPressed; const FilmedButton({required this.label, required this.onPressed}); @override Widget build(BuildContext c)=> FilledButton(onPressed:onPressed, style: FilmedButton.styleFrom(backgroundColor:Colors.white, padding:EdgeInsets.symmetric(horizontal:28, vertical:14), shape:RoundedRectangleBorder(borderRadius:BorderRadius.circular(12))), child:Text(label, style:TextStyle(color:Colors.black, fontWeight:FontWeight.bold))); }
+class _ScannerHomeState extends State<ScannerHome>
+    with SingleTickerProviderStateMixin {
+  final MobileScannerController controller = MobileScannerController();
+  late TabController tabs;
+  List<ScanRecord> history = <ScanRecord>[];
+  String? lastValue;
+  DateTime? lastScan;
+
+  @override
+  void initState() {
+    super.initState();
+    history = ScanStore.load();
+    tabs = TabController(length: 2, vsync: this);
+  }
+
+  @override
+  void dispose() {
+    controller.dispose();
+    tabs.dispose();
+    super.dispose();
+  }
+
+  Future<void> _onDetect(BarcodeCapture capture) async {
+    if (capture.barcodes.isEmpty) return;
+
+    final barcode = capture.barcodes.first;
+    final value = barcode.rawValue;
+    if (value == null || value.trim().isEmpty) return;
+
+    final now = DateTime.now();
+
+    // منع التكرار السريع لنفس القيمة
+    if (value == lastValue &&
+        lastScan != null &&
+        now.difference(lastScan!).inMilliseconds < 1800) {
+      return;
+    }
+
+    lastValue = value;
+    lastScan = now;
+
+    final record = ScanRecord(
+      value: value,
+      format: barcode.format.name,
+      time: now,
+    );
+
+    setState(() {
+      history.removeWhere((item) => item.value == value);
+      history.insert(0, record);
+      if (history.length > 80) history.removeLast();
+    });
+
+    await ScanStore.save(history);
+
+    try {
+      await controller.stop();
+    } catch (_) {}
+
+    if (!mounted) return;
+    await _showResult(record);
+
+    if (mounted) {
+      try {
+        await controller.start();
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _showResult(ScanRecord record) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF151B27),
+      showDragHandle: true,
+      builder: (context) => ResultSheet(record: record),
+    );
+  }
+
+  Future<void> clearHistory() async {
+    setState(() => history.clear());
+    await ScanStore.save(history);
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(
+          title: const Text(
+            'قارئ باركود',
+            style: TextStyle(fontWeight: FontWeight.w900),
+          ),
+          actions: <Widget>[
+            IconButton(
+              onPressed: () => controller.toggleTorch(),
+              icon: const Icon(Icons.flash_on_rounded),
+            ),
+            IconButton(
+              onPressed: clearHistory,
+              icon: const Icon(Icons.delete_sweep_outlined),
+            ),
+          ],
+          bottom: TabBar(
+            controller: tabs,
+            tabs: const <Widget>[
+              Tab(icon: Icon(Icons.qr_code_scanner_rounded), text: 'مسح'),
+              Tab(icon: Icon(Icons.history_rounded), text: 'السجل'),
+            ],
+          ),
+        ),
+        body: TabBarView(
+          controller: tabs,
+          children: <Widget>[
+            _ScannerView(controller: controller, onDetect: _onDetect),
+            HistoryView(
+              records: history,
+              onDelete: (record) async {
+                setState(() => history.remove(record));
+                await ScanStore.save(history);
+              },
+            ),
+          ],
+        ),
+      );
+}
+
+// ============================================================
+// عرض الكاميرا + الإطار
+// ============================================================
+class _ScannerView extends StatelessWidget {
+  const _ScannerView({required this.controller, required this.onDetect});
+
+  final MobileScannerController controller;
+  final Function(BarcodeCapture) onDetect;
+
+  @override
+  Widget build(BuildContext context) => Stack(
+        fit: StackFit.expand,
+        children: <Widget>[
+          MobileScanner(
+            controller: controller,
+            onDetect: onDetect,
+          ),
+          Container(
+            decoration: BoxDecoration(color: Colors.black.withOpacity(.18)),
+          ),
+          const Center(child: ScanFrame()),
+          Positioned(
+            top: 38,
+            left: 28,
+            right: 28,
+            child: Column(
+              children: <Widget>[
+                const Text(
+                  'وجّه الكاميرا نحو الرمز',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'سيتم التعرف عليه تلقائيًا',
+                  style: TextStyle(color: Colors.white.withOpacity(.72)),
+                ),
+              ],
+            ),
+          ),
+          Positioned(
+            bottom: 32,
+            left: 24,
+            right: 24,
+            child: Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(.55),
+                borderRadius: BorderRadius.circular(22),
+              ),
+              child: const Row(
+                children: <Widget>[
+                  Icon(
+                    Icons.tips_and_updates_outlined,
+                    color: ScannerTheme.cyan,
+                  ),
+                  SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      'يدعم QR والروابط والمنتجات والنصوص.',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      );
+}
+
+// ============================================================
+// عرض سجل الفحص
+// ============================================================
+class HistoryView extends StatelessWidget {
+  const HistoryView({Key? key, required this.records, required this.onDelete})
+      : super(key: key);
+
+  final List<ScanRecord> records;
+  final Future<void> Function(ScanRecord) onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    if (records.isEmpty) {
+      return const Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Icon(Icons.qr_code_2_rounded, size: 70, color: ScannerTheme.cyan),
+            SizedBox(height: 16),
+            Text(
+              'لا يوجد سجل بعد',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+            ),
+            SizedBox(height: 8),
+            Text('ابدأ بمسح أول رمز'),
+          ],
+        ),
+      );
+    }
+
+    return ListView.builder(
+      padding: const EdgeInsets.all(16),
+      itemCount: records.length,
+      itemBuilder: (context, index) {
+        final record = records[index];
+        return Dismissible(
+          key: ValueKey('${record.value}$index'),
+          onDismissed: (_) => onDelete(record),
+          background: Container(
+            margin: const EdgeInsets.only(bottom: 10),
+            decoration: BoxDecoration(
+              color: Colors.redAccent,
+              borderRadius: BorderRadius.circular(18),
+            ),
+            alignment: Alignment.centerRight,
+            padding: const EdgeInsets.only(right: 22),
+            child: const Icon(Icons.delete_outline),
+          ),
+          child: Card(
+            child: ListTile(
+              contentPadding: const EdgeInsets.all(14),
+              leading: Container(
+                width: 46,
+                height: 46,
+                decoration: BoxDecoration(
+                  color: ScannerTheme.cyan.withOpacity(.14),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: const Icon(
+                  Icons.qr_code_2_rounded,
+                  color: ScannerTheme.cyan,
+                ),
+              ),
+              title: Text(
+                record.value,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                textDirection: TextDirection.ltr,
+              ),
+              subtitle: Text(
+                '${record.format}  •  ${record.time.day}/${record.time.month}/${record.time.year}',
+              ),
+              trailing: IconButton(
+                onPressed: () => Clipboard.setData(
+                  ClipboardData(text: record.value),
+                ),
+                icon: const Icon(Icons.copy_rounded),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ============================================================
+// لوحة النتيجة (Bottom Sheet)
+// ============================================================
+class ResultSheet extends StatelessWidget {
+  const ResultSheet({Key? key, required this.record}) : super(key: key);
+
+  final ScanRecord record;
+
+  bool get isUrl =>
+      record.value.startsWith('http://') ||
+      record.value.startsWith('https://');
+
+  Future<void> open() async {
+    final uri = Uri.tryParse(record.value);
+    if (uri != null) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(22, 4, 22, 28),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              const Icon(
+                Icons.check_circle_rounded,
+                color: ScannerTheme.cyan,
+                size: 56,
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'تم التعرف على الرمز',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 21, fontWeight: FontWeight.w900),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                record.format,
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.white.withOpacity(.6)),
+              ),
+              const SizedBox(height: 20),
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(.22),
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: SelectableText(
+                  record.value,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 16, height: 1.5),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: <Widget>[
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: () => Clipboard.setData(
+                        ClipboardData(text: record.value),
+                      ),
+                      icon: const Icon(Icons.copy_rounded),
+                      label: const Text('نسخ'),
+                    ),
+                  ),
+                  if (isUrl) ...<Widget>[
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: open,
+                        icon: const Icon(Icons.open_in_new_rounded),
+                        label: const Text('فتح الرابط'),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ],
+          ),
+        ),
+      );
+}
